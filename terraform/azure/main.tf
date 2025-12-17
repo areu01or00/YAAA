@@ -20,6 +20,7 @@ terraform {
 # Configure Azure Provider
 provider "azurerm" {
   features {}
+  skip_provider_registration = true  # We registered manually
 }
 
 # Add a random acr_suffix to the acr name to make it globally unique.

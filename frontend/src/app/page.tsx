@@ -80,7 +80,9 @@ interface GraphData {
 function getApiUrl(): string {
   if (typeof window === "undefined") return "";
   const port = window.location.port;
-  if (port !== "8000") return "http://localhost:8000";
+  // Dev: frontend on 3000, backend on 8000
+  if (port === "3000") return "http://localhost:8000";
+  // Production: same origin (frontend served by backend)
   return "";
 }
 
