@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from core import arxiv_client, embeddings, clustering, llm, openalex
+from core import arxiv_client, embeddings, clustering, llm, openalex, chat
 
 load_dotenv()
 
@@ -40,6 +40,45 @@ class SearchResponse(BaseModel):
     query: str
     expanded_queries: list[str] = []
     max_citations: int = 0  # For normalizing pulse intensity
+
+
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class PaperContext(BaseModel):
+    arxiv_id: str
+    title: str
+    abstract: str
+    pdf_url: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    papers: list[PaperContext]
+    history: list[ChatMessage] = []
+    parse_pdfs: bool = True  # Whether to parse PDFs with VLM
+
+
+class ChatResponse(BaseModel):
+    response: str
+    papers_parsed: list[str] = []  # arxiv_ids of papers that were parsed
+
+
+class ParsePaperRequest(BaseModel):
+    arxiv_id: str
+    pdf_url: str
+
+
+class ParsePaperResponse(BaseModel):
+    arxiv_id: str
+    content: str
+    success: bool
+
+
+# In-memory cache for parsed papers (in production, use Redis or similar)
+_paper_content_cache: dict[str, str] = {}
 
 
 @app.get("/health")
@@ -128,6 +167,92 @@ async def search(request: SearchRequest):
         expanded_queries=queries,
         max_citations=max_citations
     )
+
+
+@app.post("/api/parse-paper", response_model=ParsePaperResponse)
+async def parse_paper(request: ParsePaperRequest):
+    """Parse a paper's PDF using VLM."""
+    # Check cache first
+    if request.arxiv_id in _paper_content_cache:
+        return ParsePaperResponse(
+            arxiv_id=request.arxiv_id,
+            content=_paper_content_cache[request.arxiv_id],
+            success=True
+        )
+
+    # Parse PDF
+    content = await chat.parse_pdf_with_vlm(request.pdf_url, max_pages=5)
+
+    if content:
+        _paper_content_cache[request.arxiv_id] = content
+        return ParsePaperResponse(
+            arxiv_id=request.arxiv_id,
+            content=content,
+            success=True
+        )
+    else:
+        return ParsePaperResponse(
+            arxiv_id=request.arxiv_id,
+            content="",
+            success=False
+        )
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """Chat about papers with optional PDF parsing."""
+    if not request.message.strip():
+        raise HTTPException(400, "Message cannot be empty")
+
+    if not request.papers:
+        raise HTTPException(400, "At least one paper required for context")
+
+    papers_parsed = []
+
+    # Parse PDFs if requested and not already cached
+    if request.parse_pdfs:
+        import asyncio
+
+        async def parse_if_needed(paper: PaperContext) -> None:
+            if paper.arxiv_id not in _paper_content_cache:
+                content = await chat.parse_pdf_with_vlm(paper.pdf_url, max_pages=3)
+                if content:
+                    _paper_content_cache[paper.arxiv_id] = content
+                    papers_parsed.append(paper.arxiv_id)
+
+        # Parse papers concurrently (limit to 3 at a time)
+        semaphore = asyncio.Semaphore(3)
+
+        async def parse_with_limit(paper: PaperContext) -> None:
+            async with semaphore:
+                await parse_if_needed(paper)
+
+        await asyncio.gather(*[parse_with_limit(p) for p in request.papers])
+
+    # Build paper dicts for chat
+    paper_dicts = [
+        {
+            "arxiv_id": p.arxiv_id,
+            "title": p.title,
+            "abstract": p.abstract,
+            "pdf_url": p.pdf_url,
+        }
+        for p in request.papers
+    ]
+
+    # Convert history to dict format
+    history = [{"role": m.role, "content": m.content} for m in request.history]
+
+    # Chat with LLM
+    response = await chat.chat_with_context(
+        message=request.message,
+        papers=paper_dicts,
+        paper_contents=_paper_content_cache,
+        history=history,
+        use_web_search=True,
+    )
+
+    return ChatResponse(response=response, papers_parsed=papers_parsed)
 
 
 if os.path.exists("static"):
