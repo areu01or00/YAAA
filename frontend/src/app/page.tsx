@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import dynamic from "next/dynamic";
 
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
@@ -74,7 +74,7 @@ function getApiUrl(): string {
 async function searchPapers(
   query: string,
   maxResults: number
-): Promise<{ papers: Paper[]; categories: Category[] }> {
+): Promise<{ papers: Paper[]; categories: Category[]; expanded_queries: string[] }> {
   const url = `${getApiUrl()}/api/search`;
   console.log("Fetching:", url, { query, max_results: maxResults });
 
@@ -158,12 +158,64 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("");
   const [graphData, setGraphData] = useState<GraphData | null>(null);
+  const [papers, setPapers] = useState<Paper[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [expandedQueries, setExpandedQueries] = useState<string[]>([]);
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
 
+  // Filters
+  const [dateFilter, setDateFilter] = useState<string>("all");
+  const [visibleClusters, setVisibleClusters] = useState<Set<number>>(new Set());
+
   const containerRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<any>(null);
+
+  // Date filter cutoffs
+  const dateFilterCutoff = useMemo(() => {
+    const now = new Date();
+    switch (dateFilter) {
+      case "1y": return new Date(now.getFullYear() - 1, now.getMonth(), now.getDate());
+      case "2y": return new Date(now.getFullYear() - 2, now.getMonth(), now.getDate());
+      case "5y": return new Date(now.getFullYear() - 5, now.getMonth(), now.getDate());
+      default: return null;
+    }
+  }, [dateFilter]);
+
+  // Filtered graph data
+  const filteredGraphData = useMemo(() => {
+    if (!graphData) return null;
+
+    const filteredNodes = graphData.nodes.filter((node) => {
+      // Cluster filter
+      if (!visibleClusters.has(node.cluster)) return false;
+
+      // Date filter - find the paper to get its date
+      if (dateFilterCutoff) {
+        const paper = papers.find((p) => p.arxiv_id === node.id);
+        if (paper) {
+          const paperDate = new Date(paper.published);
+          if (paperDate < dateFilterCutoff) return false;
+        }
+      }
+
+      return true;
+    });
+
+    const nodeIds = new Set(filteredNodes.map((n) => n.id));
+    const filteredLinks = graphData.links.filter((link) => {
+      // Handle both string IDs and object references (react-force-graph mutates these)
+      const sourceId = typeof link.source === "string" ? link.source : (link.source as any).id;
+      const targetId = typeof link.target === "string" ? link.target : (link.target as any).id;
+      return nodeIds.has(sourceId) && nodeIds.has(targetId);
+    });
+
+    return { nodes: filteredNodes, links: filteredLinks };
+  }, [graphData, visibleClusters, dateFilterCutoff, papers]);
+
+  // Count visible papers
+  const visibleCount = filteredGraphData?.nodes.length ?? 0;
+  const totalCount = graphData?.nodes.length ?? 0;
 
   useEffect(() => {
     const updateDimensions = () => {
@@ -184,20 +236,26 @@ export default function Home() {
 
     setIsLoading(true);
     setGraphData(null);
+    setPapers([]);
     setCategories([]);
+    setExpandedQueries([]);
+    setDateFilter("all");
 
     try {
-      setLoadingStatus("Fetching papers...");
-      const { papers, categories } = await searchPapers(query, paperCount);
+      setLoadingStatus("Expanding query...");
+      const { papers: fetchedPapers, categories: fetchedCategories, expanded_queries } = await searchPapers(query, paperCount);
+      setExpandedQueries(expanded_queries);
 
-      if (papers.length === 0) {
+      if (fetchedPapers.length === 0) {
         setLoadingStatus("No papers found");
         setIsLoading(false);
         return;
       }
 
-      setCategories(categories);
-      const data = buildGraphData(papers, categories);
+      setPapers(fetchedPapers);
+      setCategories(fetchedCategories);
+      setVisibleClusters(new Set(fetchedCategories.map(c => c.id)));
+      const data = buildGraphData(fetchedPapers, fetchedCategories);
       setGraphData(data);
       setLoadingStatus("");
 
@@ -332,8 +390,43 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Categories Legend */}
+        {/* Sidebar Content */}
         <div style={{ flex: 1, overflow: "auto", padding: "0 16px 16px" }}>
+          {/* Expanded Queries */}
+          {expandedQueries.length > 0 && (
+            <div style={{ marginBottom: "20px" }}>
+              <div
+                style={{
+                  fontSize: "0.7rem",
+                  color: "var(--text-tertiary)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.05em",
+                  marginBottom: "8px",
+                  fontWeight: 500,
+                }}
+              >
+                Search Queries
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                {expandedQueries.map((q, i) => (
+                  <span
+                    key={i}
+                    style={{
+                      fontSize: "0.7rem",
+                      padding: "4px 8px",
+                      background: "var(--bg-tertiary)",
+                      borderRadius: "3px",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    {q}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Categories Legend */}
           {categories.length > 0 && (
             <>
               <div
@@ -443,10 +536,10 @@ export default function Home() {
           </div>
         )}
 
-        {graphData && !isLoading && (
+        {filteredGraphData && !isLoading && (
           <ForceGraph2D
             ref={graphRef}
-            graphData={graphData}
+            graphData={filteredGraphData}
             width={dimensions.width}
             height={dimensions.height}
             nodeCanvasObject={nodeCanvasObject}
@@ -566,6 +659,131 @@ export default function Home() {
         )}
         </div>
       </main>
+
+      {/* Right Sidebar - Filters */}
+      {graphData && (
+        <aside
+          style={{
+            width: 200,
+            background: "var(--bg-secondary)",
+            borderLeft: "1px solid var(--border-subtle)",
+            padding: "16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "20px",
+            overflow: "auto",
+          }}
+        >
+          {/* Paper Count */}
+          <div style={{ fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+            Showing <strong style={{ color: "var(--text-primary)" }}>{visibleCount}</strong> of {totalCount} papers
+          </div>
+
+          {/* Date Filter */}
+          <div>
+            <div
+              style={{
+                fontSize: "0.7rem",
+                color: "var(--text-tertiary)",
+                textTransform: "uppercase",
+                letterSpacing: "0.05em",
+                marginBottom: "10px",
+                fontWeight: 500,
+              }}
+            >
+              Date Range
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              {[
+                { value: "all", label: "All time" },
+                { value: "5y", label: "Last 5 years" },
+                { value: "2y", label: "Last 2 years" },
+                { value: "1y", label: "Last year" },
+              ].map((opt) => (
+                <label
+                  key={opt.value}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    fontSize: "0.8rem",
+                    color: dateFilter === opt.value ? "var(--text-primary)" : "var(--text-secondary)",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="dateFilter"
+                    value={opt.value}
+                    checked={dateFilter === opt.value}
+                    onChange={(e) => setDateFilter(e.target.value)}
+                    style={{ accentColor: "var(--accent)" }}
+                  />
+                  {opt.label}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* Cluster Toggle */}
+          <div>
+            <div
+              style={{
+                fontSize: "0.7rem",
+                color: "var(--text-tertiary)",
+                textTransform: "uppercase",
+                letterSpacing: "0.05em",
+                marginBottom: "10px",
+                fontWeight: 500,
+              }}
+            >
+              Categories
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              {categories.map((cat) => (
+                <label
+                  key={cat.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    fontSize: "0.75rem",
+                    color: visibleClusters.has(cat.id) ? "var(--text-primary)" : "var(--text-tertiary)",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={visibleClusters.has(cat.id)}
+                    onChange={(e) => {
+                      const newSet = new Set(visibleClusters);
+                      if (e.target.checked) {
+                        newSet.add(cat.id);
+                      } else {
+                        newSet.delete(cat.id);
+                      }
+                      setVisibleClusters(newSet);
+                    }}
+                    style={{ accentColor: cat.color }}
+                  />
+                  <span
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      background: cat.color,
+                      opacity: visibleClusters.has(cat.id) ? 1 : 0.3,
+                    }}
+                  />
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {cat.name}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </aside>
+      )}
     </div>
   );
 }

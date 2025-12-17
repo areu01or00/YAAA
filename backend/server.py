@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from core import arxiv_client, embeddings, clustering
+from core import arxiv_client, embeddings, clustering, llm
 
 load_dotenv()
 
@@ -32,6 +32,7 @@ class SearchResponse(BaseModel):
     papers: list[arxiv_client.Paper]
     categories: list[clustering.Category]
     query: str
+    expanded_queries: list[str] = []
 
 
 @app.get("/health")
@@ -45,10 +46,25 @@ async def search(request: SearchRequest):
     if not request.query.strip():
         raise HTTPException(400, "Query cannot be empty")
 
-    # Fetch
-    papers = await arxiv_client.fetch_papers(request.query, request.max_results)
+    # Generate expanded queries
+    queries = await llm.generate_search_queries(request.query, num_queries=6)
+
+    # Fetch papers from all queries
+    papers_per_query = max(20, request.max_results // len(queries))
+    all_papers: list[arxiv_client.Paper] = []
+    seen_ids: set[str] = set()
+
+    for q in queries:
+        fetched = await arxiv_client.fetch_papers(q, papers_per_query)
+        for p in fetched:
+            if p.arxiv_id not in seen_ids:
+                seen_ids.add(p.arxiv_id)
+                all_papers.append(p)
+
+    papers = all_papers[:request.max_results]
+
     if len(papers) < 2:
-        return SearchResponse(papers=papers, categories=[], query=request.query)
+        return SearchResponse(papers=papers, categories=[], query=request.query, expanded_queries=queries)
 
     # Embed
     texts = [f"{p.title}. {p.abstract[:500]}" for p in papers]
@@ -77,7 +93,12 @@ async def search(request: SearchRequest):
 
     categories = clustering.build_categories(papers, cluster_names)
 
-    return SearchResponse(papers=papers, categories=categories, query=request.query)
+    return SearchResponse(
+        papers=papers,
+        categories=categories,
+        query=request.query,
+        expanded_queries=queries
+    )
 
 
 if os.path.exists("static"):
