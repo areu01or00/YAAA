@@ -2,6 +2,8 @@
 
 import os
 import asyncio
+import uuid
+from enum import Enum
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +14,29 @@ from dotenv import load_dotenv
 from core import arxiv_client, embeddings, clustering, llm, openalex, chat
 
 load_dotenv()
+
+
+# Job status tracking for async PDF parsing
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ParseJob:
+    def __init__(self, arxiv_id: str, pdf_url: str):
+        self.job_id = str(uuid.uuid4())
+        self.arxiv_id = arxiv_id
+        self.pdf_url = pdf_url
+        self.status = JobStatus.PENDING
+        self.progress = 0  # 0-100
+        self.error: str | None = None
+
+
+# In-memory job tracking (in production, use Redis)
+_parse_jobs: dict[str, ParseJob] = {}
+_arxiv_to_job: dict[str, str] = {}  # Map arxiv_id to job_id for deduplication
 
 app = FastAPI(title="PaperMap API")
 
@@ -74,9 +99,21 @@ class ParsePaperRequest(BaseModel):
 
 
 class ParsePaperResponse(BaseModel):
+    """Response when starting a parse job."""
+    job_id: str
     arxiv_id: str
-    content: str
-    success: bool
+    status: str  # pending, processing, completed, failed
+    cached: bool = False  # True if already in cache
+
+
+class ParseStatusResponse(BaseModel):
+    """Response when checking parse job status."""
+    job_id: str
+    arxiv_id: str
+    status: str
+    progress: int  # 0-100
+    content: str | None = None  # Only present when completed
+    error: str | None = None  # Only present when failed
 
 
 # In-memory cache for parsed papers (in production, use Redis or similar)
@@ -171,57 +208,106 @@ async def search(request: SearchRequest):
     )
 
 
+async def _run_parse_job(job: ParseJob):
+    """Background task to parse PDF."""
+    try:
+        job.status = JobStatus.PROCESSING
+        job.progress = 10
+
+        # Parse PDF - processes ALL pages
+        content = await chat.parse_pdf_with_vlm(job.pdf_url)
+
+        if content:
+            _paper_content_cache[job.arxiv_id] = content
+            job.status = JobStatus.COMPLETED
+            job.progress = 100
+        else:
+            job.status = JobStatus.FAILED
+            job.error = "Failed to extract content from PDF"
+    except Exception as e:
+        job.status = JobStatus.FAILED
+        job.error = str(e)
+
+
 @app.post("/api/parse-paper", response_model=ParsePaperResponse)
 async def parse_paper(request: ParsePaperRequest):
-    """Parse a paper's PDF using VLM."""
-    # Check cache first
+    """Start parsing a paper's PDF. Returns immediately with job ID."""
+    # Check cache first - return immediately if already parsed
     if request.arxiv_id in _paper_content_cache:
         return ParsePaperResponse(
+            job_id="cached",
             arxiv_id=request.arxiv_id,
-            content=_paper_content_cache[request.arxiv_id],
-            success=True
+            status=JobStatus.COMPLETED,
+            cached=True
         )
 
-    # Parse PDF - processes ALL pages
-    content = await chat.parse_pdf_with_vlm(request.pdf_url)
+    # Check if job already exists for this paper
+    if request.arxiv_id in _arxiv_to_job:
+        existing_job_id = _arxiv_to_job[request.arxiv_id]
+        if existing_job_id in _parse_jobs:
+            job = _parse_jobs[existing_job_id]
+            return ParsePaperResponse(
+                job_id=job.job_id,
+                arxiv_id=request.arxiv_id,
+                status=job.status,
+                cached=False
+            )
 
-    if content:
-        _paper_content_cache[request.arxiv_id] = content
-        return ParsePaperResponse(
-            arxiv_id=request.arxiv_id,
-            content=content,
-            success=True
-        )
-    else:
-        return ParsePaperResponse(
-            arxiv_id=request.arxiv_id,
-            content="",
-            success=False
-        )
+    # Create new job
+    job = ParseJob(request.arxiv_id, request.pdf_url)
+    _parse_jobs[job.job_id] = job
+    _arxiv_to_job[request.arxiv_id] = job.job_id
+
+    # Start background task
+    asyncio.create_task(_run_parse_job(job))
+
+    return ParsePaperResponse(
+        job_id=job.job_id,
+        arxiv_id=request.arxiv_id,
+        status=job.status,
+        cached=False
+    )
+
+
+@app.get("/api/parse-status/{job_id}", response_model=ParseStatusResponse)
+async def parse_status(job_id: str):
+    """Check status of a parse job."""
+    # Handle cached responses
+    if job_id == "cached":
+        raise HTTPException(400, "Use arxiv_id to check cached papers")
+
+    if job_id not in _parse_jobs:
+        raise HTTPException(404, "Job not found")
+
+    job = _parse_jobs[job_id]
+
+    # Include content if completed
+    content = None
+    if job.status == JobStatus.COMPLETED and job.arxiv_id in _paper_content_cache:
+        content = _paper_content_cache[job.arxiv_id]
+
+    return ParseStatusResponse(
+        job_id=job.job_id,
+        arxiv_id=job.arxiv_id,
+        status=job.status,
+        progress=job.progress,
+        content=content,
+        error=job.error
+    )
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    """Chat about papers with optional PDF parsing."""
+    """Chat about papers using cached PDF content."""
     if not request.message.strip():
         raise HTTPException(400, "Message cannot be empty")
 
     if not request.papers:
         raise HTTPException(400, "At least one paper required for context")
 
-    papers_parsed = []
-
-    # Parse PDFs if requested and not already cached
-    # All papers process concurrently - global VLM semaphore handles rate limiting
-    if request.parse_pdfs:
-        async def parse_if_needed(paper: PaperContext) -> None:
-            if paper.arxiv_id not in _paper_content_cache:
-                content = await chat.parse_pdf_with_vlm(paper.pdf_url)
-                if content:
-                    _paper_content_cache[paper.arxiv_id] = content
-                    papers_parsed.append(paper.arxiv_id)
-
-        await asyncio.gather(*[parse_if_needed(p) for p in request.papers])
+    # No inline parsing - frontend handles parsing via polling
+    # Just use whatever is in cache
+    papers_parsed = [p.arxiv_id for p in request.papers if p.arxiv_id in _paper_content_cache]
 
     # Build paper dicts for chat
     paper_dicts = [

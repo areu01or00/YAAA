@@ -269,7 +269,7 @@ export default function Home() {
       });
     }
 
-    // Pre-parse newly added papers
+    // Pre-parse newly added papers with polling
     added.forEach(async (paper) => {
       if (parsedPapers.has(paper.id) || parsingPapers.has(paper.id)) return;
 
@@ -280,6 +280,7 @@ export default function Home() {
         const fullPaper = papers.find(p => p.arxiv_id === paper.id);
         const pdfUrl = fullPaper?.pdf_url || `https://arxiv.org/pdf/${paper.id}.pdf`;
 
+        // Start parse job
         const response = await fetch(`${getApiUrl()}/api/parse-paper`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -289,11 +290,42 @@ export default function Home() {
           }),
         });
 
-        if (response.ok) {
-          const data = await response.json();
-          if (data.success) {
+        if (!response.ok) throw new Error('Failed to start parse job');
+
+        const data = await response.json();
+
+        // If cached, mark as parsed immediately
+        if (data.cached || data.status === 'completed') {
+          setParsedPapers(prev => new Set([...prev, paper.id]));
+          setParsingPapers(prev => {
+            const next = new Set(prev);
+            next.delete(paper.id);
+            return next;
+          });
+          return;
+        }
+
+        // Poll for status
+        const jobId = data.job_id;
+        const pollInterval = 2000; // 2 seconds
+        const maxPolls = 300; // 10 minutes max
+
+        for (let i = 0; i < maxPolls; i++) {
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
+
+          const statusRes = await fetch(`${getApiUrl()}/api/parse-status/${jobId}`);
+          if (!statusRes.ok) throw new Error('Failed to get parse status');
+
+          const status = await statusRes.json();
+
+          if (status.status === 'completed') {
             setParsedPapers(prev => new Set([...prev, paper.id]));
+            break;
+          } else if (status.status === 'failed') {
+            console.error(`Parse failed for ${paper.id}: ${status.error}`);
+            break;
           }
+          // Still processing, continue polling
         }
       } catch (error) {
         console.error(`Failed to pre-parse paper ${paper.id}:`, error);
