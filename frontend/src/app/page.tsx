@@ -271,8 +271,8 @@ export default function Home() {
     }
   };
 
-  const handleNodeHover = useCallback((node: GraphNode | null) => {
-    setHoveredNode(node);
+  const handleNodeHover = useCallback((node: any) => {
+    setHoveredNode(node as GraphNode | null);
   }, []);
 
   // Seeded random for deterministic dendrites
