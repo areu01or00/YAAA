@@ -21,8 +21,8 @@ _openrouter_client = AsyncOpenAI(
 # Thread pool for blocking operations
 _executor = ThreadPoolExecutor(max_workers=4)
 
-# Global shared semaphore for VLM calls - 15 concurrent across ALL papers
-_vlm_semaphore = asyncio.Semaphore(15)
+# VLM concurrency limit
+VLM_CONCURRENCY = 15
 
 
 async def fetch_pdf(url: str) -> bytes | None:
@@ -104,13 +104,17 @@ async def parse_pdf_with_vlm(pdf_url: str) -> str:
     if not images:
         return ""
 
-    print(f"Processing {len(images)} pages from PDF")
+    print(f"Processing {len(images)} pages from PDF with {VLM_CONCURRENCY} concurrent requests")
 
-    vlm_model = os.getenv("OPENROUTER_MODEL_VLM", "qwen/qwen-2.5-vl-72b-instruct")
+    vlm_model = os.getenv("OPENROUTER_MODEL_VLM", "qwen/qwen3-vl-235b-a22b-instruct")
+
+    # Create semaphore inside async function to ensure correct event loop binding
+    semaphore = asyncio.Semaphore(VLM_CONCURRENCY)
 
     async def extract_page(page_num: int, img_b64: str) -> tuple[int, str]:
         """Extract text from a single page image using shared client."""
-        async with _vlm_semaphore:
+        async with semaphore:
+            print(f"  → Starting page {page_num + 1}/{len(images)}")
             try:
                 response = await _openrouter_client.chat.completions.create(
                     model=vlm_model,
@@ -119,24 +123,27 @@ async def parse_pdf_with_vlm(pdf_url: str) -> str:
                             "role": "user",
                             "content": [
                                 {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                                },
-                                {
                                     "type": "text",
                                     "text": "Extract all text content from this research paper page. Include section headers, body text, equations (describe them), figure captions, and table contents. Be thorough but concise."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{img_b64}"}
                                 }
                             ]
                         }
                     ],
-                    temperature=0.1,
+                    max_tokens=4000,
+                    temperature=0,
                     timeout=120,
                 )
                 if response.choices:
+                    print(f"  ✓ Page {page_num + 1} done")
                     return (page_num, response.choices[0].message.content)
+                print(f"  ✗ Page {page_num + 1} - no response")
                 return (page_num, "")
             except Exception as e:
-                print(f"VLM extraction failed for page {page_num}: {e}")
+                print(f"  ✗ Page {page_num + 1} - error: {e}")
                 return (page_num, "")
 
     # Process ALL pages concurrently
