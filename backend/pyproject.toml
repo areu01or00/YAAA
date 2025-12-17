@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "numpy>=1.26.0",
     "duckduckgo-search>=6.0.0",
+    "pyalex>=0.14",
 ]
 
 [tool.uv]

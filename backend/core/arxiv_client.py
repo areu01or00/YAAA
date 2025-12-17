@@ -19,6 +19,8 @@ class Paper(BaseModel):
     x: Optional[float] = None
     y: Optional[float] = None
     neighbors: Optional[list[str]] = None  # arxiv_ids of nearest neighbors
+    citation_count: int = 0
+    references: Optional[list[str]] = None  # arxiv_ids this paper cites
 
 
 async def fetch_papers(query: str, max_results: int = 200) -> list[Paper]:

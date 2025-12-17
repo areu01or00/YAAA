@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from core import arxiv_client, embeddings, clustering, llm
+from core import arxiv_client, embeddings, clustering, llm, openalex
 
 load_dotenv()
 
@@ -28,11 +28,18 @@ class SearchRequest(BaseModel):
     max_results: int = 200
 
 
+class CitationLink(BaseModel):
+    source: str  # arxiv_id of citing paper
+    target: str  # arxiv_id of cited paper
+
+
 class SearchResponse(BaseModel):
     papers: list[arxiv_client.Paper]
     categories: list[clustering.Category]
+    citation_links: list[CitationLink] = []  # Real citation relationships
     query: str
     expanded_queries: list[str] = []
+    max_citations: int = 0  # For normalizing pulse intensity
 
 
 @app.get("/health")
@@ -93,11 +100,33 @@ async def search(request: SearchRequest):
 
     categories = clustering.build_categories(papers, cluster_names)
 
+    # Fetch citation data from OpenAlex
+    arxiv_ids = [p.arxiv_id for p in papers]
+    paper_id_set = set(arxiv_ids)
+    citation_data = openalex.get_citation_data_batch(arxiv_ids)
+
+    # Build citation links and update papers
+    citation_links: list[CitationLink] = []
+    max_citations = 0
+
+    for paper in papers:
+        data = citation_data.get(paper.arxiv_id, {})
+        paper.citation_count = data.get("citation_count", 0)
+        paper.references = data.get("references", [])
+        max_citations = max(max_citations, paper.citation_count)
+
+        # Add links for references that are in our paper set
+        for ref_id in paper.references or []:
+            if ref_id in paper_id_set:
+                citation_links.append(CitationLink(source=paper.arxiv_id, target=ref_id))
+
     return SearchResponse(
         papers=papers,
         categories=categories,
+        citation_links=citation_links,
         query=request.query,
-        expanded_queries=queries
+        expanded_queries=queries,
+        max_citations=max_citations
     )
 
 
