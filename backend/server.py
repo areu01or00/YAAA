@@ -1,6 +1,7 @@
 """PaperMap API Server."""
 
 import os
+import asyncio
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +60,7 @@ class ChatRequest(BaseModel):
     papers: list[PaperContext]
     history: list[ChatMessage] = []
     parse_pdfs: bool = True  # Whether to parse PDFs with VLM
+    use_web_search: bool = True  # Whether to search web for additional context
 
 
 class ChatResponse(BaseModel):
@@ -180,8 +182,8 @@ async def parse_paper(request: ParsePaperRequest):
             success=True
         )
 
-    # Parse PDF
-    content = await chat.parse_pdf_with_vlm(request.pdf_url, max_pages=5)
+    # Parse PDF - processes ALL pages
+    content = await chat.parse_pdf_with_vlm(request.pdf_url)
 
     if content:
         _paper_content_cache[request.arxiv_id] = content
@@ -210,24 +212,16 @@ async def chat_endpoint(request: ChatRequest):
     papers_parsed = []
 
     # Parse PDFs if requested and not already cached
+    # All papers process concurrently - global VLM semaphore handles rate limiting
     if request.parse_pdfs:
-        import asyncio
-
         async def parse_if_needed(paper: PaperContext) -> None:
             if paper.arxiv_id not in _paper_content_cache:
-                content = await chat.parse_pdf_with_vlm(paper.pdf_url, max_pages=3)
+                content = await chat.parse_pdf_with_vlm(paper.pdf_url)
                 if content:
                     _paper_content_cache[paper.arxiv_id] = content
                     papers_parsed.append(paper.arxiv_id)
 
-        # Parse papers concurrently (limit to 3 at a time)
-        semaphore = asyncio.Semaphore(3)
-
-        async def parse_with_limit(paper: PaperContext) -> None:
-            async with semaphore:
-                await parse_if_needed(paper)
-
-        await asyncio.gather(*[parse_with_limit(p) for p in request.papers])
+        await asyncio.gather(*[parse_if_needed(p) for p in request.papers])
 
     # Build paper dicts for chat
     paper_dicts = [
@@ -249,7 +243,7 @@ async def chat_endpoint(request: ChatRequest):
         papers=paper_dicts,
         paper_contents=_paper_content_cache,
         history=history,
-        use_web_search=True,
+        use_web_search=request.use_web_search,
     )
 
     return ChatResponse(response=response, papers_parsed=papers_parsed)

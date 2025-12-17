@@ -3,6 +3,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import dynamic from "next/dynamic";
 import { forceCollide } from "d3-force";
+import Markdown from "react-markdown";
 
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
   ssr: false,
@@ -205,6 +206,7 @@ export default function Home() {
   const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
 
   // Synaptic Context Dock state
   const [contextPapers, setContextPapers] = useState<GraphNode[]>([]);
@@ -503,6 +505,7 @@ export default function Home() {
           papers: paperContexts,
           history: chatMessages.slice(-10), // Last 10 messages for context
           parse_pdfs: true,
+          use_web_search: webSearchEnabled,
         }),
       });
 
@@ -521,7 +524,7 @@ export default function Home() {
     } finally {
       setChatLoading(false);
     }
-  }, [contextPapers, papers, chatMessages, chatLoading]);
+  }, [contextPapers, papers, chatMessages, chatLoading, webSearchEnabled]);
 
   // Bioluminescent node rendering - living neurons
   const nodeCanvasObject = useCallback(
@@ -2078,24 +2081,52 @@ export default function Home() {
                 {contextPapers.length} papers loaded
               </span>
             </div>
-            <button
-              onClick={() => setChatOpen(false)}
-              style={{
-                width: 28,
-                height: 28,
-                borderRadius: "6px",
-                background: "rgba(255, 255, 255, 0.05)",
-                border: "1px solid rgba(255, 255, 255, 0.08)",
-                cursor: "pointer",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" strokeWidth="2">
-                <path d="M18 6L6 18M6 6l12 12" />
-              </svg>
-            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {/* Web Search Toggle */}
+              <button
+                onClick={() => setWebSearchEnabled(!webSearchEnabled)}
+                title={webSearchEnabled ? "Web search ON - click to disable" : "Web search OFF - click to enable"}
+                style={{
+                  padding: "4px 10px",
+                  borderRadius: "6px",
+                  background: webSearchEnabled ? "rgba(0, 245, 212, 0.15)" : "rgba(255, 255, 255, 0.05)",
+                  border: `1px solid ${webSearchEnabled ? "rgba(0, 245, 212, 0.3)" : "rgba(255, 255, 255, 0.08)"}`,
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  fontSize: "0.6rem",
+                  color: webSearchEnabled ? "#00f5d4" : "var(--text-muted)",
+                  fontFamily: "var(--font-mono)",
+                  transition: "all 0.2s ease",
+                }}
+              >
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="11" cy="11" r="8" />
+                  <path d="M21 21l-4.35-4.35" />
+                </svg>
+                Web
+              </button>
+              {/* Close Button */}
+              <button
+                onClick={() => setChatOpen(false)}
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: "6px",
+                  background: "rgba(255, 255, 255, 0.05)",
+                  border: "1px solid rgba(255, 255, 255, 0.08)",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" strokeWidth="2">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           {/* Chat Messages */}
@@ -2156,11 +2187,15 @@ export default function Home() {
                           ? "rgba(0, 245, 212, 0.3)"
                           : "rgba(255, 255, 255, 0.06)",
                         fontSize: "0.85rem",
-                        lineHeight: 1.5,
-                        whiteSpace: "pre-wrap",
+                        lineHeight: 1.6,
                       }}
+                      className={msg.role === "assistant" ? "chat-markdown" : ""}
                     >
-                      {msg.content}
+                      {msg.role === "assistant" ? (
+                        <Markdown>{msg.content}</Markdown>
+                      ) : (
+                        msg.content
+                      )}
                     </div>
                   </div>
                 ))}
