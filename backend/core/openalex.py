@@ -56,26 +56,60 @@ def get_citation_data(arxiv_ids: list[str]) -> dict[str, dict]:
 
 
 def get_citation_data_batch(arxiv_ids: list[str]) -> dict[str, dict]:
-    """Batch fetch citation data - more efficient for many papers."""
+    """Batch fetch citation data - more efficient for many papers.
+
+    Uses DOI filter since ids.arxiv is not a valid filter field.
+    ArXiv DOI format: 10.48550/arXiv.{arxiv_id}
+    """
     results = {aid: {"citation_count": 0, "references": []} for aid in arxiv_ids}
 
-    # Build filter for batch query
-    try:
-        # Query works that have these arxiv IDs
-        works = Works().filter(ids={"arxiv": "|".join(arxiv_ids)}).get()
+    if not arxiv_ids:
+        return results
 
-        for work in works:
-            arxiv_url = work.get("ids", {}).get("arxiv", "")
-            if arxiv_url:
-                arxiv_id = arxiv_url.replace("https://arxiv.org/abs/", "")
-                # Find matching ID in our list
-                for aid in arxiv_ids:
-                    if aid in arxiv_id or arxiv_id in aid:
-                        results[aid] = {
-                            "citation_count": work.get("cited_by_count", 0) or 0,
-                            "references": []  # Would need separate calls for refs
-                        }
-                        break
+    # Convert arxiv IDs to DOIs (arxiv DOI format: 10.48550/arXiv.{id})
+    # Strip version suffix (e.g., "2301.12345v1" -> "2301.12345")
+    def to_doi(arxiv_id: str) -> str:
+        # Remove version suffix if present
+        clean_id = arxiv_id.split('v')[0] if 'v' in arxiv_id else arxiv_id
+        return f"https://doi.org/10.48550/arXiv.{clean_id}"
+
+    arxiv_to_doi = {aid: to_doi(aid) for aid in arxiv_ids}
+    doi_to_arxiv = {doi: aid for aid, doi in arxiv_to_doi.items()}
+
+    try:
+        # Query in batches of 50 (OpenAlex limit)
+        batch_size = 50
+        all_works = []
+
+        for i in range(0, len(arxiv_ids), batch_size):
+            batch = arxiv_ids[i:i + batch_size]
+            dois = [to_doi(aid) for aid in batch]
+
+            # Use pipe-separated DOIs for OR query
+            works = Works().filter(doi="|".join(dois)).get()
+            all_works.extend(works)
+
+        for work in all_works:
+            work_doi = work.get("doi", "")
+            if work_doi and work_doi in doi_to_arxiv:
+                arxiv_id = doi_to_arxiv[work_doi]
+                results[arxiv_id] = {
+                    "citation_count": work.get("cited_by_count", 0) or 0,
+                    "references": []  # References would need separate calls
+                }
+            else:
+                # Try matching via arxiv ID in ids field
+                arxiv_url = work.get("ids", {}).get("arxiv", "")
+                if arxiv_url:
+                    arxiv_id_from_url = arxiv_url.replace("https://arxiv.org/abs/", "")
+                    for aid in arxiv_ids:
+                        if aid.split('v')[0] in arxiv_id_from_url or arxiv_id_from_url in aid:
+                            results[aid] = {
+                                "citation_count": work.get("cited_by_count", 0) or 0,
+                                "references": []
+                            }
+                            break
+
     except Exception as e:
         print(f"OpenAlex batch query failed: {e}")
 

@@ -5,6 +5,7 @@ import base64
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
+import httpx
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -18,6 +19,18 @@ _openrouter_client = AsyncOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY")
 )
 
+# Shared HTTP client for PDF downloads (connection pooling)
+_pdf_client: httpx.AsyncClient | None = None
+
+
+def _get_pdf_client() -> httpx.AsyncClient:
+    """Get or create shared HTTP client for PDF downloads."""
+    global _pdf_client
+    if _pdf_client is None:
+        _pdf_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+    return _pdf_client
+
+
 # Thread pool for blocking operations
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -26,23 +39,22 @@ VLM_CONCURRENCY = 15
 
 
 async def fetch_pdf(url: str) -> bytes | None:
-    """Fetch PDF content from URL."""
-    import httpx
+    """Fetch PDF content from URL using shared client."""
     try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.content
+        client = _get_pdf_client()
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
     except Exception as e:
         print(f"Failed to fetch PDF from {url}: {e}")
         return None
 
 
-def pdf_to_images(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
+def pdf_to_images(pdf_bytes: bytes, dpi: int = 100) -> list[str]:
     """Convert PDF pages to base64 images using parallel threads.
 
     Uses ThreadPoolExecutor with 10 workers for true parallel conversion.
-    Returns list of base64 strings (PNG format).
+    Returns list of base64 strings (JPEG format for smaller size).
     """
     # First, save to temp file for multi-threaded access
     import tempfile
@@ -60,7 +72,8 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
             page = doc[page_num]
             mat = fitz.Matrix(dpi / 72, dpi / 72)
             pix = page.get_pixmap(matrix=mat)
-            img_bytes = pix.tobytes("png")
+            # JPEG is ~10x smaller than PNG, much faster to upload to VLM
+            img_bytes = pix.tobytes("jpeg", jpg_quality=85)
             b64 = base64.b64encode(img_bytes).decode('utf-8')
             doc.close()
             return (page_num, b64)
@@ -82,7 +95,7 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
             pass
 
 
-async def pdf_to_images_async(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
+async def pdf_to_images_async(pdf_bytes: bytes, dpi: int = 100) -> list[str]:
     """Async wrapper for pdf_to_images - runs in thread pool."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_executor, pdf_to_images, pdf_bytes, dpi)
@@ -128,7 +141,7 @@ async def parse_pdf_with_vlm(pdf_url: str) -> str:
                                 },
                                 {
                                     "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
                                 }
                             ]
                         }

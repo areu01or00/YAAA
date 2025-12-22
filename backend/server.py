@@ -134,13 +134,23 @@ async def search(request: SearchRequest):
     # Generate expanded queries
     queries = await llm.generate_search_queries(request.query, num_queries=6)
 
-    # Fetch papers from all queries
+    # Fetch papers from all queries - PARALLEL with staggered 3s delays
+    # Arxiv rate limit is 1 request per 3 seconds, so we stagger starts
     papers_per_query = max(20, request.max_results // len(queries))
+
+    async def fetch_with_delay(q: str, delay: float):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await arxiv_client.fetch_papers(q, papers_per_query)
+
+    # Launch all queries with staggered delays (0s, 3s, 6s, 9s, 12s, 15s)
+    tasks = [fetch_with_delay(q, i * 3.0) for i, q in enumerate(queries)]
+    results = await asyncio.gather(*tasks)
+
+    # Deduplicate results
     all_papers: list[arxiv_client.Paper] = []
     seen_ids: set[str] = set()
-
-    for q in queries:
-        fetched = await arxiv_client.fetch_papers(q, papers_per_query)
+    for fetched in results:
         for p in fetched:
             if p.arxiv_id not in seen_ids:
                 seen_ids.add(p.arxiv_id)
@@ -170,18 +180,28 @@ async def search(request: SearchRequest):
         paper.y = float(positions[i, 1])
         paper.neighbors = [papers[j].arxiv_id for j in neighbor_indices[i]]
 
-    # Name clusters
-    cluster_names = await clustering.name_clusters(papers, n_clusters, request.query)
+    # Parallel: name_clusters (LLM) + citation_data (OpenAlex API)
+    # Dean/Ghemawat: "reduce latency by overlapping independent operations"
+    arxiv_ids = [p.arxiv_id for p in papers]
+    paper_id_set = set(arxiv_ids)
+
+    # Start both tasks
+    cluster_names_task = clustering.name_clusters(papers, n_clusters, request.query)
+    citation_task = asyncio.get_event_loop().run_in_executor(
+        None, openalex.get_citation_data_batch, arxiv_ids
+    )
+
+    # Await both in parallel
+    cluster_names, citation_data = await asyncio.gather(
+        cluster_names_task, citation_task
+    )
+
+    # Apply cluster names
     for paper in papers:
         if paper.cluster in cluster_names:
             paper.cluster_name = cluster_names[paper.cluster][0]
 
     categories = clustering.build_categories(papers, cluster_names)
-
-    # Fetch citation data from OpenAlex
-    arxiv_ids = [p.arxiv_id for p in papers]
-    paper_id_set = set(arxiv_ids)
-    citation_data = openalex.get_citation_data_batch(arxiv_ids)
 
     # Build citation links and update papers
     citation_links: list[CitationLink] = []
